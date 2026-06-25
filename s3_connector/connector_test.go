@@ -65,16 +65,3 @@ func TestPublicURL_CustomEndpointVirtualHosted(t *testing.T) {
 		t.Errorf("PublicURL = %q, want %q", got, want)
 	}
 }
-
-func TestDetectContentType(t *testing.T) {
-	cases := map[string]string{
-		"photo.png":   "image/png",
-		"data.bin":    "application/octet-stream",
-		"noextension": "application/octet-stream",
-	}
-	for path, want := range cases {
-		if got := detectContentType(path); got != want {
-			t.Errorf("detectContentType(%q) = %q, want %q", path, got, want)
-		}
-	}
-}

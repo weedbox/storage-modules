@@ -4,6 +4,8 @@ An S3 (and S3-compatible) object storage connector for [Weedbox](https://github.
 
 It mirrors the high-level file API of [`weedbox/gcp-modules`](https://github.com/weedbox/gcp-modules)'s `bucket_connector`, so switching between GCS and S3 backends requires minimal code changes. A configurable endpoint lets the same connector talk to **AWS S3**, **Cloudflare R2**, **MinIO**, or any S3-compatible service.
 
+`Module()` provides the shared [`storage_connector.StorageConnector`](../storage_connector) interface, so consumers depend on the backend-agnostic contract and can swap S3 for [`local_storage_connector`](../local_storage_connector) (or any future backend) without code changes. S3-specific features (presigned URLs, the raw SDK client) remain on the concrete `*S3Connector` and are reached via a type assertion.
+
 ## Import
 
 ```go
@@ -67,6 +69,7 @@ package main
 
 import (
     "github.com/weedbox/storage-modules/s3_connector"
+    "github.com/weedbox/storage-modules/storage_connector"
     "go.uber.org/fx"
     "go.uber.org/zap"
 )
@@ -75,20 +78,36 @@ func main() {
     app := fx.New(
         fx.Provide(zap.NewDevelopment),
         s3_connector.Module("s3_storage"),
-        fx.Invoke(func(bc *s3_connector.S3Connector) {
-            // bc is ready to use here
+        fx.Invoke(func(sc storage_connector.StorageConnector) {
+            // sc is ready to use here
         }),
     )
     app.Run()
 }
 ```
 
-Any other module can then depend on `*s3_connector.S3Connector` through its `Params` struct:
+Any other module can then depend on the shared interface through its `Params` struct:
 
 ```go
 type Params struct {
     fx.In
-    Storage *s3_connector.S3Connector
+    Storage storage_connector.StorageConnector
+}
+```
+
+### Reaching S3-specific features
+
+Presigned URLs and the raw SDK client are **not** on the shared interface. When you need them, type-assert the injected interface back to the concrete type:
+
+```go
+func handler(sc storage_connector.StorageConnector) {
+    s3c, ok := sc.(*s3_connector.S3Connector)
+    if !ok {
+        // not running on the S3 backend
+        return
+    }
+    link, _ := s3c.PresignGetURL("avatars/profile.jpg", 10*time.Minute)
+    _ = link
 }
 ```
 
@@ -184,18 +203,22 @@ Unlike GCS, modern S3 buckets usually have **Block Public Access** enabled and A
 
 ## Method reference
 
-| Method | Description |
-|--------|-------------|
-| `GetBucketName() string` | Configured bucket name |
-| `GetClient() *s3.Client` | Underlying AWS S3 client |
-| `GetPresignClient() *s3.PresignClient` | Underlying presign client |
-| `WriteAsFile(filePath string, content []byte) (string, error)` | Upload raw bytes → public URL |
-| `SaveFile(req *UploaderReq) (string, error)` | Upload base64 under `{category}/{filename}` → public URL |
-| `DeleteFile(filePath string) error` | Delete a single object (idempotent) |
-| `DeleteFileWithPrefix(filePath string) error` | Delete all objects under a prefix (batched) |
-| `PresignGetURL(filePath string, expiry time.Duration) (string, error)` | Time-limited signed download URL |
-| `PresignPutURL(filePath string, expiry time.Duration) (string, error)` | Time-limited signed upload URL |
-| `PublicURL(filePath string) string` | Build the public (unsigned) URL for a key |
+Methods marked **interface** are part of the shared `storage_connector.StorageConnector`; the rest are S3-specific and require the concrete `*S3Connector` (type-assert the injected interface to reach them).
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `WriteAsFile(filePath string, content []byte) (string, error)` | interface | Upload raw bytes → public URL |
+| `SaveFile(req *UploaderReq) (string, error)` | interface | Upload base64 under `{category}/{filename}` → public URL |
+| `ReadFile(filePath string) ([]byte, error)` | interface | Download an object's full content |
+| `Exists(filePath string) (bool, error)` | interface | Whether an object exists (`HeadObject`) |
+| `DeleteFile(filePath string) error` | interface | Delete a single object (idempotent) |
+| `DeleteFileWithPrefix(filePath string) error` | interface | Delete all objects under a prefix (batched) |
+| `PublicURL(filePath string) string` | interface | Build the public (unsigned) URL for a key |
+| `PresignGetURL(filePath string, expiry time.Duration) (string, error)` | S3-specific | Time-limited signed download URL |
+| `PresignPutURL(filePath string, expiry time.Duration) (string, error)` | S3-specific | Time-limited signed upload URL |
+| `GetBucketName() string` | S3-specific | Configured bucket name |
+| `GetClient() *s3.Client` | S3-specific | Underlying AWS S3 client |
+| `GetPresignClient() *s3.PresignClient` | S3-specific | Underlying presign client |
 
 ## Types
 

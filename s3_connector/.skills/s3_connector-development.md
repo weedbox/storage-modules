@@ -13,10 +13,12 @@ with minimal code changes.
 
 **Module Path**: `s3_connector/`
 
-**Provided Type**: `*s3_connector.S3Connector` (via `s3_connector.Module(scope)`)
+**Provided Type**: `storage_connector.StorageConnector` (concrete
+`*s3_connector.S3Connector`), via `s3_connector.Module(scope)`.
 
 **Main Features**:
 - Upload raw bytes (`WriteAsFile`) and base64 payloads (`SaveFile`)
+- Read (`ReadFile`) and existence checks (`Exists`)
 - Delete single objects and entire prefixes (batched)
 - Presigned download / upload URLs (private, time-limited access)
 - Public URL construction (AWS virtual-hosted, custom endpoint, CDN base URL)
@@ -25,14 +27,15 @@ with minimal code changes.
 
 ## Module Type & Wiring
 
-This is a **plain Fx module** (concrete struct), matching the gcp-modules
-pattern — not a `weedbox.Module[P]` generic and not (yet) an
-`fxmodule.InterfaceModule`. It is injected **without** a `name` tag:
+This is a **Method 3 connector** registered with
+`fxmodule.InterfaceModule[storage_connector.StorageConnector]`. It provides the
+shared `storage_connector.StorageConnector` interface (the concrete value is
+`*S3Connector`), so consumers inject the **interface**, not the concrete type:
 
 ```go
 type Params struct {
     fx.In
-    Storage *s3_connector.S3Connector
+    Storage storage_connector.StorageConnector
 }
 ```
 
@@ -49,9 +52,22 @@ func initModules() ([]fx.Option, error) {
 }
 ```
 
-> Future option: if multiple storage backends must coexist in one `fx.App`,
-> define a shared storage interface and convert this to Method 3
-> (`fxmodule.InterfaceModule`). Currently it exposes a concrete struct.
+`InterfaceModule` registers the ctor as `name:"<scope>"` and the first loaded
+backend also claims the unnamed default — so a single-backend app injects the
+interface with no name tag. To run S3 and another backend side by side, inject
+each with `name:"<scope>"` (see
+`storage_connector/.skills/storage_connector-development.md`).
+
+### Reaching S3-specific features
+
+`PresignGetURL`, `PresignPutURL`, `GetClient`, `GetPresignClient`, and
+`GetBucketName` are **not** on the shared interface. Type-assert to reach them:
+
+```go
+if s3c, ok := sc.(*s3_connector.S3Connector); ok {
+    link, _ := s3c.PresignGetURL(key, 10*time.Minute)
+}
+```
 
 ## Configuration
 
@@ -166,6 +182,21 @@ func (c *S3Connector) SaveFile(req *UploaderReq) (string, error)
   (`github.com/google/uuid`) is generated.
 - Same upload behavior as `WriteAsFile`. Returns the public URL.
 
+### ReadFile
+
+```go
+func (c *S3Connector) ReadFile(filePath string) ([]byte, error)
+```
+- `GetObject` + `io.ReadAll` of the body. Interface method.
+
+### Exists
+
+```go
+func (c *S3Connector) Exists(filePath string) (bool, error)
+```
+- `HeadObject`; a `smithy.APIError` with code `NotFound` / `NoSuchKey` / `404`
+  maps to `(false, nil)`. Other errors propagate. Interface method.
+
 ### DeleteFile
 
 ```go
@@ -259,12 +290,14 @@ err  = bc.DeleteFileWithPrefix("avatars/user-123/")  // whole prefix, batched
 
 ## Relationships with Other Modules
 
+- **Implements**: `storage_connector.StorageConnector`.
 - **Depends on**: `*zap.Logger` (from `common-modules/logger`), Viper config,
   `fx.Lifecycle`.
 - **Mirrors**: `weedbox/gcp-modules` `bucket_connector` (GCS) — same method
   shapes and `UploaderReq` contract.
+- **Sibling**: `local_storage_connector` (same interface, swappable).
 - **Depended on by**: any application module needing object storage; inject
-  `*s3_connector.S3Connector` via `Params`.
+  `storage_connector.StorageConnector` via `Params`.
 
 ## Dependencies (go.mod)
 
@@ -274,8 +307,10 @@ err  = bc.DeleteFileWithPrefix("avatars/user-123/")  // whole prefix, batched
 | `github.com/aws/aws-sdk-go-v2/credentials` | Static credentials provider |
 | `github.com/aws/aws-sdk-go-v2/service/s3` | S3 client, presign client, paginator |
 | `github.com/aws/aws-sdk-go-v2/service/s3/types` | S3 input/types (ACL, ObjectIdentifier, Delete) |
+| `github.com/aws/smithy-go` | API error code inspection (`Exists`) |
 | `github.com/google/uuid` | Auto-generated filenames |
 | `github.com/spf13/viper` | Configuration |
+| `github.com/weedbox/weedbox/fxmodule` | `InterfaceModule` registration |
 | `go.uber.org/fx` / `go.uber.org/zap` | DI and logging |
 
 ## Verification Checklist

@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,10 +16,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 	"github.com/spf13/viper"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
+
+	"github.com/weedbox/storage-modules/storage_connector"
+	"github.com/weedbox/weedbox/fxmodule"
 )
 
 const (
@@ -29,17 +32,12 @@ const (
 	DefaultPresignExpiry = 15 * time.Minute
 )
 
-// UploaderReq is the request payload accepted by SaveFile. It mirrors the
-// gcp-modules bucket_connector contract so callers can switch backends without
-// changing their request shape.
-type UploaderReq struct {
-	FileName string `json:"file_name"` // Target filename (optional, auto-generates UUID if empty)
-	Category string `json:"category"`  // Category/directory path (object key prefix) in the bucket
-	RawData  string `json:"rowData"`   // Base64-encoded file content
-}
+// UploaderReq is an alias for the shared storage_connector.UploaderReq, kept so
+// callers can keep referencing it as s3_connector.UploaderReq.
+type UploaderReq = storage_connector.UploaderReq
 
-// S3Connector wraps an AWS S3 (or S3-compatible) client and exposes the
-// same high-level file operations as the GCP bucket_connector.
+// S3Connector wraps an AWS S3 (or S3-compatible) client and implements the
+// shared storage_connector.StorageConnector interface.
 type S3Connector struct {
 	params        Params
 	logger        *zap.Logger
@@ -48,6 +46,9 @@ type S3Connector struct {
 	scope         string
 }
 
+// Compile-time check that S3Connector satisfies the shared interface.
+var _ storage_connector.StorageConnector = (*S3Connector)(nil)
+
 type Params struct {
 	fx.In
 
@@ -55,38 +56,30 @@ type Params struct {
 	Logger    *zap.Logger
 }
 
-// Module creates an Fx module that provides a *S3Connector. The scope
-// parameter namespaces all configuration keys and logger output.
+// Module registers the S3 backend as an implementation of
+// storage_connector.StorageConnector. It can be loaded on its own (inject the
+// interface without a name tag) or side by side with other backends (inject
+// with name:"<scope>"). The scope namespaces all configuration keys and logger
+// output.
 func Module(scope string) fx.Option {
-
-	var m *S3Connector
-
-	return fx.Module(
+	return fxmodule.InterfaceModule[storage_connector.StorageConnector](
 		scope,
-		fx.Provide(func(p Params) *S3Connector {
-
-			m := &S3Connector{
+		func(p Params) storage_connector.StorageConnector {
+			c := &S3Connector{
 				params: p,
 				logger: p.Logger.Named(scope),
 				scope:  scope,
 			}
 
-			m.initDefaultConfigs()
+			c.initDefaultConfigs()
 
-			return m
-		}),
-		fx.Populate(&m),
-		fx.Invoke(func(p Params) *S3Connector {
+			p.Lifecycle.Append(fx.Hook{
+				OnStart: c.onStart,
+				OnStop:  c.onStop,
+			})
 
-			p.Lifecycle.Append(
-				fx.Hook{
-					OnStart: m.onStart,
-					OnStop:  m.onStop,
-				},
-			)
-
-			return m
-		}),
+			return c
+		},
 	)
 }
 
@@ -206,7 +199,7 @@ func (c *S3Connector) putObject(ctx context.Context, filePath string, body io.Re
 		Bucket:      aws.String(c.GetBucketName()),
 		Key:         aws.String(filePath),
 		Body:        body,
-		ContentType: aws.String(detectContentType(filePath)),
+		ContentType: aws.String(storage_connector.DetectContentType(filePath)),
 	}
 
 	// Apply a canned ACL only when explicitly configured. Modern S3 buckets
@@ -364,9 +357,38 @@ func (c *S3Connector) PublicURL(filePath string) string {
 	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucket, region, key)
 }
 
-func detectContentType(filePath string) string {
-	if ct := mime.TypeByExtension(filepath.Ext(filePath)); ct != "" {
-		return ct
+// ReadFile returns the full content of the object at filePath.
+func (c *S3Connector) ReadFile(filePath string) ([]byte, error) {
+
+	out, err := c.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(c.GetBucketName()),
+		Key:    aws.String(filePath),
+	})
+	if err != nil {
+		return nil, err
 	}
-	return "application/octet-stream"
+	defer out.Body.Close()
+
+	return io.ReadAll(out.Body)
+}
+
+// Exists reports whether an object exists at filePath.
+func (c *S3Connector) Exists(filePath string) (bool, error) {
+
+	_, err := c.client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: aws.String(c.GetBucketName()),
+		Key:    aws.String(filePath),
+	})
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.ErrorCode() {
+			case "NotFound", "NoSuchKey", "404":
+				return false, nil
+			}
+		}
+		return false, err
+	}
+
+	return true, nil
 }

@@ -10,10 +10,15 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/weedbox/storage-modules/s3_connector"
+	"github.com/weedbox/storage-modules/storage_connector"
 )
 
 // Example shows the typical way to wire the connector into a Weedbox / Fx
 // application and use it from another component.
+//
+// Module provides the backend-agnostic storage_connector.StorageConnector, so
+// consumers depend on the shared interface and can swap S3 for any other
+// implementation (e.g. local_storage_connector) without code changes.
 func Example() {
 
 	// Configuration is normally loaded from config.toml; set here for clarity.
@@ -25,8 +30,8 @@ func Example() {
 	app := fx.New(
 		fx.Provide(zap.NewDevelopment),
 		s3_connector.Module("s3_storage"),
-		fx.Invoke(func(bc *s3_connector.S3Connector) {
-			url, err := bc.WriteAsFile("images/logo.png", []byte("...binary..."))
+		fx.Invoke(func(sc storage_connector.StorageConnector) {
+			url, err := sc.WriteAsFile("images/logo.png", []byte("...binary..."))
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -35,6 +40,26 @@ func Example() {
 	)
 
 	_ = app // app.Run() starts the lifecycle in a real program.
+}
+
+// Example_presign shows how to reach S3-specific features (presigned URLs, the
+// raw client) that are not part of the shared interface: inject the interface
+// and type-assert to *s3_connector.S3Connector.
+func Example_presign() {
+
+	var sc storage_connector.StorageConnector // injected by Fx
+
+	s3c, ok := sc.(*s3_connector.S3Connector)
+	if !ok {
+		log.Fatal("storage backend is not S3")
+	}
+
+	link, err := s3c.PresignGetURL("avatars/profile.jpg", 10*time.Minute)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("download link:", link)
 }
 
 // ExampleS3Connector_WriteAsFile uploads raw bytes and returns the object's
